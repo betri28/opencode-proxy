@@ -1,6 +1,6 @@
 # OpenCode
 
-Claude Code Proxy → opencode.ai. Convert Anthropic /v1/messages ↔ OpenAI chat/completions.
+A proxy for Claude Code to call OpenCode Go package API key (https://opencode.ai/go). Converts Anthropic /v1/messages ↔ OpenAI chat/completions.
 
 ## Requirements
 
