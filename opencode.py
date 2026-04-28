@@ -4,26 +4,27 @@ Convert Anthropic /v1/messages ↔ OpenAI chat/completions
 """
 
 import json
-import sys
 import uuid
 import time
 import logging
 import os
 import sqlite3
 import threading
-import collections
 from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from rich.live import Live
-from rich.table import Table
-from rich.panel import Panel
-from rich.console import Group
-from rich import box
 
 from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT
+
+try:
+    import tiktoken
+    _encoding = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _encoding = None
+
+from dashboard import register_dashboard
+from dashboard.display import log as _log, RichLogHandler, run_terminal_loop
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -51,25 +52,9 @@ _conn.execute("""
 """)
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)")
 
-# Log buffer for Rich Live display
-_log_lines = collections.deque(maxlen=200)
-_LOG_VISIBLE = 35
-_log_scroll = 0
 
-
-def _log(msg: str):
-    global _log_scroll
-    # Skip internal API and uvicorn startup logs
-    if "/api/" in msg or "Uvicorn running" in msg:
-        return
-    ts = time.strftime("%H:%M:%S")
-    _log_lines.append(f"[{ts}] {msg}")
-    # Auto-scroll to bottom on new log
-    _log_scroll = max(0, len(_log_lines) - _LOG_VISIBLE)
-
-
-def _save_request(req_id: str, model: str, original_model: str, duration_ms: int,
-                  tokens_input: int, tokens_output: int, tokens_cache: int, success: bool = True, error: str = None):
+def _save_request(req_id, model, original_model, duration_ms,
+                  tokens_input, tokens_output, tokens_cache, success=True, error=None):
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
     with _db_lock:
         _conn.execute("""
@@ -79,17 +64,6 @@ def _save_request(req_id: str, model: str, original_model: str, duration_ms: int
         """, (req_id, timestamp, model, original_model, duration_ms,
               tokens_input, tokens_output, tokens_cache, 1 if success else 0, error))
         _conn.commit()
-
-
-class _RichLogHandler(logging.Handler):
-    def emit(self, record):
-        msg = record.getMessage()
-        # Skip internal API and uvicorn startup logs
-        if "/api/" in msg or "Uvicorn running" in msg:
-            return
-        level = record.levelname
-        ts = time.strftime("%H:%M:%S")
-        _log_lines.append(f"[{ts}] [{level}] {msg}")
 
 
 # Token usage tracking (in-memory, lost on restart)
@@ -107,13 +81,7 @@ async def lifespan(app):
     await _client.aclose()
 
 app = FastAPI(lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-
-@app.get("/")
-async def root():
-    from fastapi.responses import FileResponse
-    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+register_dashboard(app, STATIC_DIR, _conn, _db_lock)
 
 
 def _sse(event: str, payload: dict) -> bytes:
@@ -173,7 +141,7 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
         if not isinstance(content, list):
             continue
 
-        text_parts, tool_calls, thinking_text, tool_results = [], [], "", []
+        text_parts, tool_calls, thinking_parts, tool_results = [], [], [], []
 
         for block in content:
             if isinstance(block, str):
@@ -186,7 +154,7 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
             if btype == "text":
                 text_parts.append(block.get("text", ""))
             elif btype == "thinking":
-                thinking_text = block.get("thinking", "")
+                thinking_parts.append(block.get("thinking", ""))
             elif btype == "tool_use":
                 tool_calls.append({
                     "id": block.get("id", f"call_{uuid.uuid4().hex[:8]}"),
@@ -207,28 +175,29 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
         messages.extend(tool_results)
 
         # Then emit the main message (text + tool_calls + thinking)
+        joined_thinking = "\n".join(thinking_parts) if thinking_parts else ""
         if tool_calls:
             out = {
                 "role": role,
                 "content": "\n".join(text_parts) if text_parts else "",
                 "tool_calls": tool_calls,
             }
-            if thinking_text:
-                out["reasoning_content"] = thinking_text
+            if joined_thinking:
+                out["reasoning_content"] = joined_thinking
             elif thinking and is_asst:
                 out["reasoning_content"] = " "
             messages.append(out)
-        elif text_parts or thinking_text or (thinking and is_asst):
+        elif text_parts or thinking_parts or (thinking and is_asst):
             out = {"role": role, "content": "\n".join(text_parts) if text_parts else ""}
-            if thinking_text:
-                out["reasoning_content"] = thinking_text
+            if joined_thinking:
+                out["reasoning_content"] = joined_thinking
             elif thinking and is_asst:
                 out["reasoning_content"] = " "
             messages.append(out)
 
     # Build request
     oai = {"model": model, "messages": messages,
-           "max_tokens": body.get("max_tokens", 8096),
+           "max_tokens": body.get("max_tokens", 16384),
            "stream": body.get("stream", False)}
 
     for key, oai_key in [("temperature", "temperature"), ("top_p", "top_p"), ("stop_sequences", "stop")]:
@@ -274,6 +243,9 @@ def openai_to_anthropic(resp: dict, model: str) -> dict:
         blocks.append({"type": "tool_use", "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
                         "name": fn.get("name", ""), "input": inp})
 
+    if not blocks:
+        blocks.append({"type": "text", "text": ""})
+
     stop = "tool_use" if msg.get("tool_calls") else "end_turn"
     if choice.get("finish_reason") == "length":
         stop = "max_tokens"
@@ -283,129 +255,72 @@ def openai_to_anthropic(resp: dict, model: str) -> dict:
         "content": blocks, "model": model, "stop_reason": stop, "stop_sequence": None,
         "usage": {"input_tokens": usage.get("prompt_tokens", 0),
                 "output_tokens": usage.get("completion_tokens", 0),
+                "cache_creation_input_tokens": 0,
                 "cache_read_input_tokens": usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)},
     }
 
 
-def _build_display() -> Group:
-    table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan", pad_edge=False, expand=False)
-    table.add_column("Route", style="bold", width=8)
-    table.add_column("Model", style="bold", min_width=14)
-    table.add_column("Total", justify="right", min_width=10)
-    table.add_column("Input", justify="right", min_width=10)
-    table.add_column("Output", justify="right", min_width=10)
-    table.add_column("Cache", justify="right", min_width=10)
-    table.add_column("%", justify="right", min_width=6)
-
-    # Compute grand total first for percentage calculation
-    with _token_lock:
-        usage_snapshot = {m: dict(d) for m, d in _token_usage.items()}
-
-    sum_total = 0
-    for route_info in ROUTES.values():
-        d = usage_snapshot[route_info["model"]]
-        sum_total += d["input"] + d["output"] + d["cache"]
-
-    sum_in = sum_out = sum_cache = 0
-    shown = set()
-    for route_name, route_info in ROUTES.items():
-        model = route_info["model"]
-        shown.add(model)
-        d = usage_snapshot[model]
-        total = d["input"] + d["output"] + d["cache"]
-        sum_in += d["input"]
-        sum_out += d["output"]
-        sum_cache += d["cache"]
-        pct = f"{total / sum_total * 100:.1f}%" if sum_total else "0%"
-        table.add_row(
-            route_name, model,
-            f"{total:,}", f"{d['input']:,}", f"{d['output']:,}", f"{d['cache']:,}",
-            pct,
-        )
-
-    # Show any other models with usage not covered by routes
-    for model, d in usage_snapshot.items():
-        if model in shown:
-            continue
-        total = d["input"] + d["output"] + d["cache"]
-        if total == 0:
-            continue
-        sum_in += d["input"]
-        sum_out += d["output"]
-        sum_cache += d["cache"]
-        pct = f"{total / sum_total * 100:.1f}%" if sum_total else "0%"
-        table.add_row(
-            "-", model,
-            f"{total:,}", f"{d['input']:,}", f"{d['output']:,}", f"{d['cache']:,}",
-            pct,
-        )
-
-    sum_total = sum_in + sum_out + sum_cache
-    table.add_row(
-        "[bold yellow]ALL[/]", "",
-        f"[bold yellow]{sum_total:,}[/]",
-        f"[bold yellow]{sum_in:,}[/]",
-        f"[bold yellow]{sum_out:,}[/]",
-        f"[bold yellow]{sum_cache:,}[/]",
-        f"[bold yellow]100%[/]",
-    )
-
-    start = max(0, min(_log_scroll, len(_log_lines) - _LOG_VISIBLE))
-    visible = list(_log_lines)[start:start + _LOG_VISIBLE]
-    log_text = "\n".join(visible) if visible else "[dim]waiting for requests...[/]"
-    if len(_log_lines) > _LOG_VISIBLE:
-        log_text += f"\n[dim]↑ {start + 1}/{len(_log_lines)} logs (scroll with ↑↓ keys)[/]"
-
-    return Group(
-        Panel(table, title="[bold green]Token Usage[/]", border_style="green", padding=(0, 1)),
-        Panel(log_text, title="[bold]Log[/]", border_style="dim", padding=(0, 1)),
-    )
-
-
 def _estimate_tokens(text: str) -> int:
+    if _encoding:
+        return len(_encoding.encode(text))
     return max(1, len(text) // 3)
 
 
 def _estimate_input_tokens(body: dict) -> int:
     """Estimate input tokens from message content, tools, and tool_results."""
-    total = 0
+    chunks = []
 
     # System prompt
     system = body.get("system", "")
     if isinstance(system, str):
-        total += len(system)
+        chunks.append(system)
     elif isinstance(system, list):
         for s in system:
             if isinstance(s, str):
-                total += len(s)
+                chunks.append(s)
             elif isinstance(s, dict):
-                total += len(s.get("text", ""))
+                chunks.append(s.get("text", ""))
 
     # Tools definitions
     for tool in body.get("tools", []):
-        total += len(tool.get("name", ""))
-        total += len(tool.get("description", ""))
-        total += len(str(tool.get("input_schema", {})))
+        chunks.append(tool.get("name", ""))
+        chunks.append(tool.get("description", ""))
+        chunks.append(str(tool.get("input_schema", {})))
 
     # Messages
     for msg in body.get("messages", []):
         content = msg.get("content", "")
         if isinstance(content, str):
-            total += len(content)
+            chunks.append(content)
         elif isinstance(content, list):
             for block in content:
                 if isinstance(block, str):
-                    total += len(block)
+                    chunks.append(block)
                 elif isinstance(block, dict):
                     btype = block.get("type", "")
                     if btype == "tool_result":
-                        total += len(_extract_text(block.get("content", "")))
+                        chunks.append(_extract_text(block.get("content", "")))
                     elif btype == "thinking":
-                        total += len(block.get("thinking", ""))
+                        chunks.append(block.get("thinking", ""))
                     else:
-                        total += len(block.get("text", "")) + len(str(block.get("input", "")))
+                        chunks.append(block.get("text", ""))
+                        chunks.append(str(block.get("input", "")))
 
-    return max(1, total // 3)
+    combined = "\n".join(chunks)
+    if _encoding:
+        return len(_encoding.encode(combined))
+    return max(1, len(combined) // 3)
+
+
+def _extract_cache_tokens(usage: dict) -> int:
+    details = usage.get("prompt_tokens_details") or {}
+    if "cached_tokens" in details:
+        return details["cached_tokens"]
+    if "cached_tokens" in usage:
+        return usage["cached_tokens"]
+    if "cache_read_input_tokens" in usage:
+        return usage["cache_read_input_tokens"]
+    return 0
 
 
 def _elapsed_ms(start_time: float) -> int:
@@ -456,7 +371,6 @@ async def messages(request: Request):
                 _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                              0, 0, 0, success=False, error=f"HTTP {resp.status_code}")
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
-            # Track token usage (Anthropic or OpenAI format)
             data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
             usage = data.get("usage", {})
             req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
@@ -471,13 +385,15 @@ async def messages(request: Request):
                          req_in, req_out, req_cache, success=True)
             return Response(content=resp.content, media_type="application/json")
 
-        # Estimate input tokens for Anthropic streaming (MiniMax may not send usage in message_start)
+        # Estimate input tokens for Anthropic streaming
         est_input = _estimate_input_tokens(body)
         with _token_lock:
             _token_usage[model_id]["input"] += est_input
 
         async def anthropic_stream():
-            stream_in = stream_out = stream_cache = 0
+            stream_in = None
+            stream_out = stream_cache = 0
+            _line_buf = ""
             try:
                 async with _client.stream("POST", endpoint, json=body, headers=a_headers) as resp:
                     if resp.status_code != 200:
@@ -490,8 +406,11 @@ async def messages(request: Request):
                         yield _sse("error", error_payload)
                         return
                     async for chunk in resp.aiter_bytes():
-                        # Parse SSE chunks to track token usage
-                        for line in chunk.decode("utf-8", errors="replace").split("\n"):
+                        yield chunk
+                        _line_buf += chunk.decode("utf-8", errors="replace")
+                        while "\n" in _line_buf:
+                            line, _line_buf = _line_buf.split("\n", 1)
+                            line = line.strip()
                             if not line.startswith("data:"):
                                 continue
                             data_str = line[5:].strip()
@@ -506,35 +425,41 @@ async def messages(request: Request):
                                 usage = event.get("message", {}).get("usage", {})
                                 stream_in = usage.get("input_tokens")
                                 if stream_in is not None:
-                                    # Overwrite the estimate with actual value from API
                                     with _token_lock:
                                         _token_usage[model_id]["input"] -= est_input
                                         _token_usage[model_id]["input"] += stream_in
+                                stream_cache = usage.get("cache_read_input_tokens", 0)
+                                if stream_cache:
+                                    with _token_lock:
+                                        _token_usage[model_id]["cache"] += stream_cache
                             elif etype == "message_delta":
                                 usage = event.get("usage", {})
                                 stream_out = usage.get("output_tokens", 0)
-                                with _token_lock:
-                                    _token_usage[model_id]["output"] += stream_out
-                        yield chunk
+                # After stream ends, apply final output token count
+                if stream_out:
+                    with _token_lock:
+                        _token_usage[model_id]["output"] += stream_out
             except Exception as e:
                 _log(f"  ERROR stream: {e}")
-                if not stream_in:
+                if stream_in is None:
                     with _token_lock:
                         _token_usage[model_id]["input"] -= est_input
+                if stream_out:
+                    with _token_lock:
+                        _token_usage[model_id]["output"] += stream_out
                 _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                             stream_in or est_input, stream_out, stream_cache, success=False, error=str(e))
+                             stream_in if stream_in is not None else est_input, stream_out, stream_cache, success=False, error=str(e))
                 return
-            # Use estimated input if API didn't provide usage in message_start
-            logged_in = stream_in or est_input
-            if stream_in or stream_out:
-                _log(f"  ← {model_id} | +{logged_in} in (est) | +{stream_out} out | +{stream_cache} cache")
+            logged_in = stream_in if stream_in is not None else est_input
+            if stream_in is not None or stream_out:
+                _log(f"  ← {model_id} | +{logged_in} in | +{stream_out} out | +{stream_cache} cache")
                 _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                              logged_in, stream_out, stream_cache, success=True)
 
         return StreamingResponse(anthropic_stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
-    # ── OpenAI-protocol (existing logic) ────────────────────────
+    # ── OpenAI-protocol ─────────────────────────────────────────
     oai_body = anthropic_to_openai(body, model_id)
     headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
     is_stream = oai_body["stream"]
@@ -545,16 +470,21 @@ async def messages(request: Request):
             _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
             _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                          0, 0, 0, success=False, error=f"HTTP {resp.status_code}")
-            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+            try:
+                err_data = resp.json()
+                err_msg = err_data.get("error", {})
+                if isinstance(err_msg, dict):
+                    err_msg = err_msg.get("message", resp.text[:200])
+            except Exception:
+                err_msg = resp.text[:200]
+            anthro_err = json.dumps({"type": "error", "error": {"type": "api_error", "message": f"HTTP {resp.status_code}: {err_msg}"}},
+                                    ensure_ascii=False)
+            return Response(content=anthro_err, status_code=resp.status_code, media_type="application/json")
         data = resp.json()
         usage = data.get("usage", {})
         req_in = usage.get("prompt_tokens", 0)
         req_out = usage.get("completion_tokens", 0)
-        cache = (
-            usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
-            or usage.get("cached_tokens", 0)
-            or usage.get("cache_read_input_tokens", 0)
-        )
+        cache = _extract_cache_tokens(usage)
         with _token_lock:
             _token_usage[model_id]["input"] += req_in
             _token_usage[model_id]["output"] += req_out
@@ -567,21 +497,18 @@ async def messages(request: Request):
 
     # Streaming
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-
-    # Request usage in stream for accurate tracking
     oai_body["stream_options"] = {"include_usage": True}
 
-    # Estimate input tokens from message content
     stream_in_est = _estimate_input_tokens(body)
     with _token_lock:
         _token_usage[model_id]["input"] += stream_in_est
 
     async def stream_gen():
         started = False
-        open_blocks = []  # Ordered list of open block indices
+        open_blocks = []
         text_block_idx = None
         reasoning_block_idx = None
-        tool_block_idx = {}  # api_idx -> block_idx
+        tool_block_idx = {}
         next_block_idx = 0
         stream_out_tokens = 0
         actual_usage = None
@@ -604,7 +531,6 @@ async def messages(request: Request):
                     data = line[5:].strip()
 
                     if data == "[DONE]":
-                        # Use actual usage from stream if available, otherwise use estimates
                         final_in = stream_in_est
                         final_out = stream_out_tokens
                         final_cache = 0
@@ -615,20 +541,26 @@ async def messages(request: Request):
                                     final_in = stream_in_est
                                 final_out = actual_usage.get("completion_tokens")
                                 if final_out is None:
+                                    total = actual_usage.get("total_tokens")
+                                    prompt = actual_usage.get("prompt_tokens")
+                                    if total is not None and prompt is not None:
+                                        final_out = total - prompt
+                                if final_out is None:
                                     final_out = stream_out_tokens
-                                final_cache = (
-                                    actual_usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
-                                    or actual_usage.get("cached_tokens", 0)
-                                    or actual_usage.get("cache_read_input_tokens", 0)
-                                )
+                                final_cache = _extract_cache_tokens(actual_usage)
                                 _token_usage[model_id]["input"] -= stream_in_est
                                 _token_usage[model_id]["input"] += final_in
                                 _token_usage[model_id]["output"] += final_out
                                 if final_cache:
                                     _token_usage[model_id]["cache"] += final_cache
                             else:
-                                # No actual usage: add the estimate we accumulated during streaming
                                 _token_usage[model_id]["output"] += stream_out_tokens
+                        if not started:
+                            started = True
+                            yield _sse("message_start", {"type": "message_start", "message": {
+                                "id": msg_id, "type": "message", "role": "assistant", "content": [],
+                                "model": original_model, "stop_reason": None, "stop_sequence": None,
+                                "usage": {"input_tokens": 0, "output_tokens": 0}}})
                         for idx in open_blocks:
                             yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
                         has_tools = bool(tool_block_idx)
@@ -645,7 +577,6 @@ async def messages(request: Request):
                     except Exception:
                         continue
 
-                    # Capture usage from stream (sent in final chunk when stream_options.include_usage=true)
                     chunk_usage = chunk.get("usage")
                     if chunk_usage and isinstance(chunk_usage, dict):
                         actual_usage = chunk_usage
@@ -741,248 +672,39 @@ async def health():
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request):
-    """Đếm tokens cho Anthropic messages request."""
     try:
         body = json.loads(await request.body())
     except Exception:
         return Response(content='{"error":"invalid json"}', status_code=400)
-
-    # Sử dụng hàm _estimate_input_tokens đã có
     tokens = _estimate_input_tokens(body)
     return {"input_tokens": tokens}
-
-
-@app.get("/api/stats")
-async def get_stats(from_date: str = None, to_date: str = None):
-    where, params = _build_where(from_date, to_date)
-
-    with _db_lock:
-        row = _conn.execute(
-            "SELECT COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
-            "       COALESCE(SUM(tokens_cache), 0), COUNT(*),"
-            "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
-            "       SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END),"
-            "       COALESCE(AVG(duration_ms), 0)"
-            " FROM requests " + where,
-            params,
-        ).fetchone()
-
-        totals = {
-            "input": row[0], "output": row[1], "cache": row[2],
-            "total": row[0] + row[1] + row[2],
-            "count": row[3],
-            "success_count": row[4], "fail_count": row[5],
-            "avg_duration_ms": int(row[6])
-        }
-
-        rows = _conn.execute(
-            "SELECT model, COALESCE(SUM(tokens_input), 0), COALESCE(SUM(tokens_output), 0),"
-            "       COALESCE(SUM(tokens_cache), 0), COUNT(*),"
-            "       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),"
-            "       SUM(CASE WHEN success = 0 OR success IS NULL THEN 1 ELSE 0 END),"
-            "       COALESCE(AVG(duration_ms), 0)"
-            " FROM requests " + where +
-            " GROUP BY model",
-            params,
-        ).fetchall()
-
-    sum_total = totals["total"]
-    models = {}
-    for r in rows:
-        t = r[1] + r[2] + r[3]
-        models[r[0]] = {
-            "input": r[1], "output": r[2], "cache": r[3], "total": t,
-            "pct": f"{t/sum_total*100:.1f}%" if sum_total else "0%",
-            "count": r[4], "success_count": r[5], "fail_count": r[6],
-            "avg_duration_ms": int(r[7])
-        }
-
-    return {"models": models, "totals": totals}
-
-
-@app.get("/api/logs")
-async def get_logs(limit: int = 100, offset: int = 0):
-    lines = list(_log_lines)
-    return {
-        "logs": lines[offset:offset+limit],
-        "total": len(lines),
-        "has_more": offset + limit < len(lines)
-    }
-
-
-def _build_where(from_date: str = None, to_date: str = None):
-    conditions, params = [], []
-    if from_date:
-        conditions.append("timestamp >= ?")
-        params.append(from_date)
-    if to_date:
-        conditions.append("timestamp <= ?")
-        params.append(to_date + "T23:59:59")
-    where = "WHERE " + " AND ".join(conditions) if conditions else ""
-    return where, params
-
-
-@app.get("/api/history")
-async def get_history(from_date: str = None, to_date: str = None, limit: int = 20, offset: int = 0):
-    where, params = _build_where(from_date, to_date)
-    query = "SELECT * FROM requests " + where + " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
-
-    with _db_lock:
-        rows = _conn.execute(query, params).fetchall()
-        # Get total count for pagination
-        count_query = "SELECT COUNT(*) FROM requests " + where
-        total_row = _conn.execute(count_query, params[:-2]).fetchone()
-        total_count = total_row[0] if total_row else 0
-
-    return {
-        "logs": [
-            {
-                "id": r["id"],
-                "timestamp": r["timestamp"],
-                "model": r["model"],
-                "original_model": r["original_model"],
-                "duration_ms": r["duration_ms"],
-                "tokens_input": r["tokens_input"],
-                "tokens_output": r["tokens_output"],
-                "tokens_cache": r["tokens_cache"],
-                "success": bool(r["success"]),
-                "error": r["error"]
-            }
-            for r in rows
-        ],
-        "total": total_count,
-        "page": offset // limit + 1,
-        "per_page": limit,
-        "has_more": offset + limit < total_count
-    }
-
-
-@app.delete("/api/history")
-async def delete_history(before: str = None, all: bool = False):
-    with _db_lock:
-        if all:
-            _conn.execute("DELETE FROM requests")
-        elif before:
-            _conn.execute("DELETE FROM requests WHERE timestamp < ?", (before + "T23:59:59",))
-        else:
-            return {"error": "Specify 'before' date or 'all=true'"}
-        _conn.commit()
-    return {"status": "deleted"}
 
 
 if __name__ == "__main__":
     import threading as th
     from uvicorn import Config, Server
 
-    # Redirect uvicorn logs to Rich buffer
-    h = _RichLogHandler()
+    h = RichLogHandler()
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         lg = logging.getLogger(name)
         lg.handlers = [h]
         lg.propagate = False
 
-    # Main API server
     config = Config(app, host=HOST, port=PORT, log_level="info", log_config=None)
     server = Server(config)
 
     thread = th.Thread(target=server.run, daemon=True)
     thread.start()
 
-    # Start web UI on separate port (if different from PORT)
     if WEB_PORT != PORT:
         web_config = Config(app, host=HOST, port=WEB_PORT, log_level="info", log_config=None)
         web_server = Server(web_config)
         web_thread = th.Thread(target=web_server.run, daemon=True)
         web_thread.start()
 
-    time.sleep(0.5)  # Wait for servers to start
+    time.sleep(0.5)
     _log(f"🔌 API: http://localhost:{PORT}")
     if WEB_PORT != PORT:
         _log(f"🌐 Web UI: http://localhost:{WEB_PORT}")
 
-    _running = True
-
-    def _input_thread():
-        global _log_scroll, _running
-        if sys.platform == "win32":
-            import msvcrt
-            while _running:
-                if msvcrt.kbhit():
-                    try:
-                        ch = msvcrt.getch()
-                        # Arrow keys on Windows: prefix b'\xe0' or b'\x00' + scan code
-                        if ch in (b'\xe0', b'\x00'):
-                            ch2 = msvcrt.getch()
-                            if ch2 == b'H':       # Up arrow
-                                _log_scroll = max(0, _log_scroll - 1)
-                            elif ch2 == b'P':     # Down arrow
-                                _log_scroll = min(max(0, len(_log_lines) - _LOG_VISIBLE), _log_scroll + 1)
-                            elif ch2 == b'I':     # Page Up
-                                _log_scroll = max(0, _log_scroll - _LOG_VISIBLE)
-                            elif ch2 == b'Q':     # Page Down
-                                _log_scroll = min(max(0, len(_log_lines) - _LOG_VISIBLE), _log_scroll + _LOG_VISIBLE)
-                            elif ch2 == b'G':     # Home
-                                _log_scroll = 0
-                            elif ch2 == b'O':     # End
-                                _log_scroll = max(0, len(_log_lines) - _LOG_VISIBLE)
-                            continue
-                        ch = ch.decode("utf-8", errors="ignore")
-                        if ch == "\x03":          # Ctrl-C
-                            _running = False
-                        elif ch == "k":
-                            _log_scroll = max(0, _log_scroll - 1)
-                        elif ch == "j":
-                            _log_scroll = min(max(0, len(_log_lines) - _LOG_VISIBLE), _log_scroll + 1)
-                        elif ch == "G":
-                            _log_scroll = max(0, len(_log_lines) - _LOG_VISIBLE)
-                        elif ch == "g":
-                            _log_scroll = 0
-                    except Exception:
-                        pass
-                else:
-                    time.sleep(0.05)
-        else:
-            import tty, termios, select
-            fd = sys.stdin.fileno()
-            old = termios.tcgetattr(fd)
-            tty.setraw(fd)
-            try:
-                while _running:
-                    if select.select([sys.stdin], [], [], 0.05)[0]:
-                        ch = sys.stdin.read(1)
-                        if ch == "\x03":
-                            _running = False
-                        elif ch == "\x1b":       # Escape sequence (arrow keys)
-                            seq = sys.stdin.read(2) if select.select([sys.stdin], [], [], 0.01)[0] else ""
-                            if seq == "[A":       # Up
-                                _log_scroll = max(0, _log_scroll - 1)
-                            elif seq == "[B":     # Down
-                                _log_scroll = min(max(0, len(_log_lines) - _LOG_VISIBLE), _log_scroll + 1)
-                            elif seq == "[5":     # Page Up
-                                if sys.stdin.read(1) == "~":
-                                    _log_scroll = max(0, _log_scroll - _LOG_VISIBLE)
-                            elif seq == "[6":     # Page Down
-                                if sys.stdin.read(1) == "~":
-                                    _log_scroll = min(max(0, len(_log_lines) - _LOG_VISIBLE), _log_scroll + _LOG_VISIBLE)
-                            elif seq == "[H":     # Home
-                                _log_scroll = 0
-                            elif seq == "[F":     # End
-                                _log_scroll = max(0, len(_log_lines) - _LOG_VISIBLE)
-                        elif ch in ("k",):
-                            _log_scroll = max(0, _log_scroll - 1)
-                        elif ch in ("j",):
-                            _log_scroll = min(max(0, len(_log_lines) - _LOG_VISIBLE), _log_scroll + 1)
-                        elif ch == "G":
-                            _log_scroll = max(0, len(_log_lines) - _LOG_VISIBLE)
-                        elif ch == "g":
-                            _log_scroll = 0
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-    th.Thread(target=_input_thread, daemon=True).start()
-
-    with Live(_build_display(), refresh_per_second=1, screen=True) as live:
-        while _running:
-            live.update(_build_display())
-            time.sleep(1)
+    run_terminal_loop(ROUTES, _token_usage, _token_lock)

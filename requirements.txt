@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 httpx
 rich
+tiktoken>=0.7.0
