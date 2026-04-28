@@ -581,11 +581,11 @@ async def messages(request: Request):
                             yield _sse("message_start", {"type": "message_start", "message": {
                                 "id": msg_id, "type": "message", "role": "assistant", "content": [],
                                 "model": original_model, "stop_reason": None, "stop_sequence": None,
-                                "usage": {"input_tokens": 0, "output_tokens": 0}}})
+                                "usage": {"input_tokens": final_in, "output_tokens": 0}}})
                         for idx in open_blocks:
                             yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
                         has_tools = bool(tool_block_idx)
-                        yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use" if has_tools else "end_turn"}, "usage": {"output_tokens": 0}})
+                        yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use" if has_tools else "end_turn"}, "usage": {"output_tokens": final_out}})
                         yield _sse("message_stop", {"type": "message_stop"})
                         log_tag = "" if actual_usage else " (est)"
                         _log(f"  ← {model_id} | +{final_in} in{log_tag} | +{final_out} out{log_tag} | +{final_cache} cache")
@@ -616,7 +616,7 @@ async def messages(request: Request):
                         yield _sse("message_start", {"type": "message_start", "message": {
                             "id": msg_id, "type": "message", "role": "assistant", "content": [],
                             "model": original_model, "stop_reason": None, "stop_sequence": None,
-                            "usage": {"input_tokens": 0, "output_tokens": 0}}})
+                            "usage": {"input_tokens": stream_in_est, "output_tokens": 0}}})
 
                     # Text
                     text = ""
@@ -676,7 +676,7 @@ async def messages(request: Request):
             if started:
                 for idx in open_blocks:
                     yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
-                yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "error"}, "usage": {"output_tokens": 0}})
+                yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "error"}, "usage": {"output_tokens": stream_out_tokens}})
                 yield _sse("message_stop", {"type": "message_stop"})
 
     return StreamingResponse(stream_gen(), media_type="text/event-stream",
