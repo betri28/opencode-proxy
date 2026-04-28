@@ -1,6 +1,22 @@
-# OpenCode
+# OpenCode-Proxy
 
-A proxy for Claude Code to call OpenCode Go package API key (https://opencode.ai/go). Converts Anthropic /v1/messages ↔ OpenAI chat/completions.
+A python proxy that lets you use [OpenCode Go](https://opencode.ai/docs/go/) subscription with [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
+
+Claude Code CLI (Anthropic format)
+        │
+        ▼
+  ┌─────────────────────┐
+  │   OpenCode Proxy    │  ← opencode.py (FastAPI, port 4000)
+  │                     │
+  │  1. Route matching  │  "claude-sonnet-4" → "glm-5.1"
+  │  2. Format convert  │  Anthropic ↔ OpenAI
+  │  3. Forward request │  → opencode.ai
+  │  4. Convert back    │  OpenAI → Anthropic
+  │  5. Track tokens    │  → SQLite
+  └─────────────────────┘
+        │
+        ▼
+   opencode.ai (backend AI models)
 
 ## Requirements
 

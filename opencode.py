@@ -47,22 +47,35 @@ _conn.execute("""
         tokens_output INTEGER,
         tokens_cache INTEGER,
         success INTEGER,
-        error TEXT
+        error TEXT,
+        protocol TEXT,
+        is_stream INTEGER,
+        thinking TEXT,
+        effort TEXT
     )
 """)
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)")
+for col, default in [("protocol", "NULL"), ("is_stream", "0"), ("thinking", "NULL"), ("effort", "NULL")]:
+    try:
+        _conn.execute(f"ALTER TABLE requests ADD COLUMN {col} TEXT DEFAULT {default}")
+    except Exception:
+        pass
+_conn.commit()
 
 
 def _save_request(req_id, model, original_model, duration_ms,
-                  tokens_input, tokens_output, tokens_cache, success=True, error=None):
+                  tokens_input, tokens_output, tokens_cache, success=True, error=None,
+                  protocol=None, is_stream=False, thinking=None, effort=None):
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
     with _db_lock:
         _conn.execute("""
             INSERT OR REPLACE INTO requests (id, timestamp, model, original_model, duration_ms,
-                tokens_input, tokens_output, tokens_cache, success, error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                tokens_input, tokens_output, tokens_cache, success, error,
+                protocol, is_stream, thinking, effort)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (req_id, timestamp, model, original_model, duration_ms,
-              tokens_input, tokens_output, tokens_cache, 1 if success else 0, error))
+              tokens_input, tokens_output, tokens_cache, 1 if success else 0, error,
+              protocol, 1 if is_stream else 0, thinking, effort))
         _conn.commit()
 
 
@@ -369,7 +382,8 @@ async def messages(request: Request):
             if resp.status_code != 200:
                 _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
                 _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                             0, 0, 0, success=False, error=f"HTTP {resp.status_code}")
+                             0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                             protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort)
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
             data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
             usage = data.get("usage", {})
@@ -382,7 +396,8 @@ async def messages(request: Request):
                 _token_usage[model_id]["cache"] += req_cache
             _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{req_cache} cache")
             _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                         req_in, req_out, req_cache, success=True)
+                         req_in, req_out, req_cache, success=True,
+                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort)
             return Response(content=resp.content, media_type="application/json")
 
         # Estimate input tokens for Anthropic streaming
@@ -400,7 +415,8 @@ async def messages(request: Request):
                         err = await resp.aread()
                         _log(f"  ERROR {resp.status_code}: {err[:300]}")
                         _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                     0, 0, 0, success=False, error=f"HTTP {resp.status_code}")
+                                     0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort)
                         error_payload = {"type": "error", "error": {"type": "api_error",
                                        "message": f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"}}
                         yield _sse("error", error_payload)
@@ -448,13 +464,15 @@ async def messages(request: Request):
                     with _token_lock:
                         _token_usage[model_id]["output"] += stream_out
                 _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                             stream_in if stream_in is not None else est_input, stream_out, stream_cache, success=False, error=str(e))
+                             stream_in if stream_in is not None else est_input, stream_out, stream_cache, success=False, error=str(e),
+                             protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort)
                 return
             logged_in = stream_in if stream_in is not None else est_input
             if stream_in is not None or stream_out:
                 _log(f"  ← {model_id} | +{logged_in} in | +{stream_out} out | +{stream_cache} cache")
                 _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                             logged_in, stream_out, stream_cache, success=True)
+                             logged_in, stream_out, stream_cache, success=True,
+                             protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort)
 
         return StreamingResponse(anthropic_stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
@@ -469,7 +487,8 @@ async def messages(request: Request):
         if resp.status_code != 200:
             _log(f"  ERROR {resp.status_code}: {resp.text[:300]}")
             _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                         0, 0, 0, success=False, error=f"HTTP {resp.status_code}")
+                         0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                         protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort)
             try:
                 err_data = resp.json()
                 err_msg = err_data.get("error", {})
@@ -491,7 +510,8 @@ async def messages(request: Request):
             _token_usage[model_id]["cache"] += cache
         _log(f"  ← {model_id} | +{req_in} in | +{req_out} out | +{cache} cache")
         _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                     req_in, req_out, cache, success=True)
+                     req_in, req_out, cache, success=True,
+                     protocol=protocol, is_stream=False, thinking=thinking_type, effort=effort)
         return Response(content=json.dumps(openai_to_anthropic(data, original_model), ensure_ascii=False),
                         media_type="application/json")
 
@@ -519,7 +539,8 @@ async def messages(request: Request):
                     err = await resp.aread()
                     _log(f"  ERROR {resp.status_code}: {err[:300]}")
                     _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                 0, 0, 0, success=False, error=f"HTTP {resp.status_code}")
+                                 0, 0, 0, success=False, error=f"HTTP {resp.status_code}",
+                                 protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort)
                     error_payload = {"type": "error", "error": {"type": "api_error",
                                    "message": f"HTTP {resp.status_code}: {err.decode('utf-8', errors='replace')[:200]}"}}
                     yield _sse("error", error_payload)
@@ -569,7 +590,8 @@ async def messages(request: Request):
                         log_tag = "" if actual_usage else " (est)"
                         _log(f"  ← {model_id} | +{final_in} in{log_tag} | +{final_out} out{log_tag} | +{final_cache} cache")
                         _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                                     final_in, final_out, final_cache, success=True)
+                                     final_in, final_out, final_cache, success=True,
+                                     protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort)
                         break
 
                     try:
@@ -649,7 +671,8 @@ async def messages(request: Request):
             with _token_lock:
                 _token_usage[model_id]["input"] -= stream_in_est
             _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                         stream_in_est, stream_out_tokens, 0, success=False, error=str(e))
+                         stream_in_est, stream_out_tokens, 0, success=False, error=str(e),
+                         protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort)
             if started:
                 for idx in open_blocks:
                     yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})

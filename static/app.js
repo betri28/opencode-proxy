@@ -67,7 +67,8 @@ function renderStats(data) {
     document.getElementById('total-all').textContent = formatNumber(t.total);
     document.getElementById('total-success').textContent = formatNumber(t.success_count);
     document.getElementById('total-fail').textContent = formatNumber(t.fail_count);
-    document.getElementById('avg-duration').textContent = t.avg_duration_ms ? `${t.avg_duration_ms}ms` : '-';
+    document.getElementById('avg-duration').textContent = t.avg_duration_ms ? formatNumber(t.avg_duration_ms) : '-';
+    document.getElementById('total-requests').textContent = formatNumber(t.count);
 
     const tbody = document.getElementById('model-tbody');
     const models = data.models;
@@ -88,7 +89,7 @@ function renderStats(data) {
             <td>${s.pct}</td>
             <td>${formatNumber(s.success_count)}</td>
             <td>${formatNumber(s.fail_count)}</td>
-            <td>${s.avg_duration_ms ? s.avg_duration_ms + 'ms' : '-'}</td>
+            <td>${s.avg_duration_ms ? formatNumber(s.avg_duration_ms) : '-'}</td>
         </tr>`;
     }
     tbody.innerHTML = html;
@@ -173,16 +174,23 @@ function renderCharts(data) {
 function renderHistory(data) {
     const tbody = document.getElementById('history-tbody');
     if (!data || data.logs.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="9">No history</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="10">No history</td></tr>';
         updatePagination(1, 1);
         return;
     }
 
     let html = '';
     for (const log of data.logs) {
-        const duration = log.duration_ms ? `${log.duration_ms}ms` : '-';
-        const status = log.success ? '<span class="status-ok">&#10004;</span>' : '<span class="status-fail">&#10008;</span>';
-        const error = log.error ? `<span class="error-text">${log.error}</span>` : '-';
+        const duration = log.duration_ms ? formatNumber(log.duration_ms) : '-';
+        let status;
+        if (log.success) {
+            status = '<span class="status-ok">&#10004;</span>';
+        } else {
+            const errMsg = (log.error || '').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+            status = `<span class="status-fail">&#10008;</span><span class="status-info" title="${errMsg}">&#9432;</span>`;
+        }
+        const thinking = log.thinking || '-';
+        const effort = log.effort || '-';
         html += `<tr>
             <td>${formatDateTime(log.timestamp)}</td>
             <td>${log.original_model || '-'}</td>
@@ -191,8 +199,9 @@ function renderHistory(data) {
             <td>${formatNumber(log.tokens_input)}</td>
             <td>${formatNumber(log.tokens_output)}</td>
             <td>${formatNumber(log.tokens_cache)}</td>
+            <td>${thinking}</td>
+            <td>${effort}</td>
             <td>${status}</td>
-            <td>${error}</td>
         </tr>`;
     }
     tbody.innerHTML = html;

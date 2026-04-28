@@ -177,6 +177,14 @@ header h1 {
     color: var(--accent);
 }
 
+.stat-box.box-requests {
+    padding: 10px 15px;
+}
+
+.stat-box.box-requests .value {
+    font-size: 16px;
+}
+
 /* ── Tables ── */
 table {
     width: 100%;
@@ -286,6 +294,33 @@ tbody tr:hover {
 .status-fail {
     color: var(--danger);
     font-size: 16px;
+}
+
+.status-info {
+    color: var(--text-secondary);
+    font-size: 13px;
+    margin-left: 4px;
+    cursor: pointer;
+    position: relative;
+}
+
+.status-info:hover::after {
+    content: attr(title);
+    position: absolute;
+    left: 50%;
+    bottom: 100%;
+    transform: translateX(-50%);
+    background: var(--danger);
+    color: #fff;
+    padding: 6px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    white-space: nowrap;
+    max-width: 350px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    z-index: 10;
+    pointer-events: none;
 }
 
 .error-text {

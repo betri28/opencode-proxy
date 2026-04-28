@@ -109,7 +109,11 @@ def register_dashboard(app, static_dir, conn, db_lock):
                     "tokens_output": r["tokens_output"],
                     "tokens_cache": r["tokens_cache"],
                     "success": bool(r["success"]),
-                    "error": r["error"]
+                    "error": r["error"],
+                    "protocol": r["protocol"] if "protocol" in r.keys() else None,
+                    "is_stream": bool(r["is_stream"]) if "is_stream" in r.keys() else False,
+                    "thinking": r["thinking"] if "thinking" in r.keys() else None,
+                    "effort": r["effort"] if "effort" in r.keys() else None,
                 }
                 for r in rows
             ],
