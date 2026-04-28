@@ -195,12 +195,12 @@ function renderHistory(data) {
             <td>${formatDateTime(log.timestamp)}</td>
             <td>${log.original_model || '-'}</td>
             <td>${log.model || '-'}</td>
-            <td>${duration}</td>
             <td>${formatNumber(log.tokens_input)}</td>
             <td>${formatNumber(log.tokens_output)}</td>
             <td>${formatNumber(log.tokens_cache)}</td>
             <td>${thinking}</td>
             <td>${effort}</td>
+            <td>${duration}</td>
             <td>${status}</td>
         </tr>`;
     }
