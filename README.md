@@ -136,3 +136,7 @@ requirements.txt         # Python dependencies
 logs/                    # Runtime directory (auto-created)
   requests.db            # SQLite - request history
 ```
+
+## License
+
+[MIT](LICENSE)
