@@ -2,21 +2,7 @@
 
 A python proxy that lets you use [OpenCode Go](https://opencode.ai/docs/go/) subscription with [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
 
-Claude Code CLI (Anthropic format)
-        │
-        ▼
-  ┌─────────────────────┐
-  │   OpenCode Proxy    │  ← opencode.py (FastAPI, port 4000)
-  │                     │
-  │  1. Route matching  │  "claude-sonnet-4" → "glm-5.1"
-  │  2. Format convert  │  Anthropic ↔ OpenAI
-  │  3. Forward request │  → opencode.ai
-  │  4. Convert back    │  OpenAI → Anthropic
-  │  5. Track tokens    │  → SQLite
-  └─────────────────────┘
-        │
-        ▼
-   opencode.ai (backend AI models)
+<img width="449" height="319" alt="image" src="https://github.com/user-attachments/assets/9337be52-4681-414c-bb2b-ad624f079659" />
 
 ## Requirements
 
@@ -84,13 +70,15 @@ The web interface has 2 tabs:
 - Overview: Input, Output, Cache, Success, Failed, Avg Duration
 - Charts: Token Distribution, Token % by Model, Requests % by Model
 - Detailed table by model
-<img width="1187" height="790" alt="image" src="https://github.com/user-attachments/assets/3a8f61c9-9c09-4248-9c6f-fba1d08a566d" />
+<img width="1172" height="784" alt="image" src="https://github.com/user-attachments/assets/3e29adfe-14c8-4d71-a158-a7cbe0e65174" />
+
 
 ### Request History
 - Request logs with full info: time, model, duration, tokens, status
 - Filter by time: Today, 7 Days, 30 Days, Custom
 - Delete history: all or by date
-<img width="1167" height="865" alt="image" src="https://github.com/user-attachments/assets/24d9f8fb-1029-47cd-a604-35d55be206da" />
+<img width="1196" height="588" alt="image" src="https://github.com/user-attachments/assets/5e5c2118-79c3-4504-96d9-b14043bfe537" />
+
 
 ### Common Features
 - Dark/Light theme (Dark by default)
