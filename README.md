@@ -87,6 +87,7 @@ The web interface has 2 tabs:
 |--------|------|-------------|
 | POST | `/v1/messages` | Proxy Anthropic format |
 | POST | `/anthropic/v1/messages` | Proxy Anthropic format |
+| POST | `/v1/messages/count_tokens` | Estimate token count for a request |
 | GET | `/health` | Health check |
 | GET | `/api/stats` | Token usage stats (supports `from_date`, `to_date`) |
 | GET | `/api/logs` | Terminal logs |
@@ -112,15 +113,22 @@ For other settings, edit `config/settings.py`:
 ## Project Structure
 
 ```
-.env.example         # Template environment configuration (copy to .env)
-.env                 # Environment configuration (create from .env.example)
-opencode.py          # Main server
+opencode.py              # Main FastAPI server
 config/
-  settings.py        # Configuration (includes PROXY, API_KEY, ROUTES)
+  __init__.py            # Package exports
+  settings.py            # Configuration (PROXY, API_KEY, MODELS, ROUTES)
+dashboard/
+  __init__.py            # Package exports
+  api.py                 # Dashboard API endpoints (stats, logs, history)
+  display.py             # Rich terminal display (token table, log panel)
 static/
-  index.html         # Dashboard UI
-  styles.css         # Styling (dark/light theme)
-  app.js             # JavaScript
-logs/
-  requests.db        # SQLite - request history
+  index.html             # Dashboard UI
+  styles.css             # Styling (dark/light theme)
+  app.js                 # JavaScript
+requirements.txt         # Python dependencies
+.env.example             # Template environment configuration
+.env                     # Environment configuration (gitignored)
+.gitignore               # Git ignore rules
+logs/                    # Runtime directory (auto-created)
+  requests.db            # SQLite - request history
 ```
