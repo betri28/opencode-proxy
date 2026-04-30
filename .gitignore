@@ -10,7 +10,7 @@ __pycache__/
 *.so
 
 # Database
-logs/requests.db
+logs/requests.db*
 logs/*.db
 
 # IDE

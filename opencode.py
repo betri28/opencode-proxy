@@ -10,6 +10,7 @@ import logging
 import os
 import sqlite3
 import threading
+import asyncio
 from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -35,6 +36,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 _db_path = os.path.join(LOG_DIR, "requests.db")
 _conn = sqlite3.connect(_db_path, check_same_thread=False)
 _conn.row_factory = sqlite3.Row
+_conn.execute("PRAGMA journal_mode=WAL")
 _db_lock = threading.Lock()
 _conn.execute("""
     CREATE TABLE IF NOT EXISTS requests (
@@ -80,7 +82,10 @@ def _save_request(req_id, model, original_model, duration_ms,
 
 
 # Token usage tracking (in-memory, lost on restart)
-_token_usage = {model: {"input": 0, "output": 0, "cache": 0} for model in MODELS}
+import collections as _collections
+_token_usage = _collections.defaultdict(lambda: {"input": 0, "output": 0, "cache": 0})
+for model in MODELS:
+    _token_usage[model] = {"input": 0, "output": 0, "cache": 0}
 _token_lock = threading.Lock()
 
 # Shared HTTP client (reused across requests)
@@ -92,6 +97,8 @@ _client = httpx.AsyncClient(transport=_transport, timeout=300)
 async def lifespan(app):
     yield
     await _client.aclose()
+    _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    _conn.close()
 
 app = FastAPI(lifespan=lifespan)
 register_dashboard(app, STATIC_DIR, _conn, _db_lock)
@@ -101,8 +108,20 @@ def _sse(event: str, payload: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
 
 
+def _forward_headers(resp_headers) -> dict:
+    """Forward informational upstream headers to the client response."""
+    headers = {}
+    for key, value in resp_headers.items():
+        kl = key.lower()
+        if kl.startswith(("x-request-id", "x-ratelimit", "openai-", "anthropic-", "cf-", "x-cache", "x-gg")):
+            headers[key] = value
+    return headers
+
+
 def _route_for(model_name: str) -> dict:
-    name = model_name.lower()
+    name = model_name.lower().strip()
+    if not name:
+        return ROUTES["sonnet"]
     for r in ROUTES.values():
         if any(m in name for m in r["match"]):
             return r
@@ -124,8 +143,10 @@ def _extract_text(content) -> str:
                     parts.append(i.get("thinking", ""))
                 elif i.get("type") == "image":
                     parts.append(f"[image:{i.get('source', {}).get('type', 'unknown')}]")
+                elif i.get("type") == "redacted_thinking":
+                    parts.append("[redacted]")
                 else:
-                    parts.append(i.get("text", str(i)))
+                    parts.append(i.get("text", json.dumps(i, ensure_ascii=False)))
         return "\n".join(parts)
     return str(content) if content else ""
 
@@ -174,7 +195,7 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                     "type": "function",
                     "function": {
                         "name": block.get("name", ""),
-                        "arguments": json.dumps(block.get("input", {})),
+                        "arguments": json.dumps(block.get("input") or {}),
                     },
                 })
             elif btype == "tool_result":
@@ -192,7 +213,7 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
         if tool_calls:
             out = {
                 "role": role,
-                "content": "\n".join(text_parts) if text_parts else "",
+                "content": None,
                 "tool_calls": tool_calls,
             }
             if joined_thinking:
@@ -212,6 +233,9 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
     oai = {"model": model, "messages": messages,
            "max_tokens": body.get("max_tokens", 16384),
            "stream": body.get("stream", False)}
+
+    if thinking and isinstance(body.get("thinking"), dict) and body["thinking"].get("budget_tokens"):
+        oai["max_completion_tokens"] = body["thinking"]["budget_tokens"]
 
     for key, oai_key in [("temperature", "temperature"), ("top_p", "top_p"), ("stop_sequences", "stop")]:
         if key in body:
@@ -245,8 +269,12 @@ def openai_to_anthropic(resp: dict, model: str) -> dict:
     blocks = []
     if reasoning := msg.get("reasoning_content"):
         blocks.append({"type": "thinking", "thinking": reasoning})
-    if msg.get("content"):
-        blocks.append({"type": "text", "text": msg["content"]})
+    content = msg.get("content")
+    if content:
+        text = content if isinstance(content, str) else "".join(
+            p.get("text", "") for p in content if isinstance(p, dict)
+        )
+        blocks.append({"type": "text", "text": text})
     for tc in msg.get("tool_calls", []):
         fn = tc.get("function", {})
         try:
@@ -259,16 +287,17 @@ def openai_to_anthropic(resp: dict, model: str) -> dict:
     if not blocks:
         blocks.append({"type": "text", "text": ""})
 
-    stop = "tool_use" if msg.get("tool_calls") else "end_turn"
-    if choice.get("finish_reason") == "length":
-        stop = "max_tokens"
+    stop_reason_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use", "content_filter": "content_filter"}
+    stop = stop_reason_map.get(choice.get("finish_reason", ""), "end_turn")
+    if msg.get("tool_calls"):
+        stop = "tool_use"
 
     return {
         "id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant",
         "content": blocks, "model": model, "stop_reason": stop, "stop_sequence": None,
         "usage": {"input_tokens": usage.get("prompt_tokens", 0),
-                "output_tokens": usage.get("completion_tokens", 0),
-                "cache_creation_input_tokens": 0,
+                "output_tokens": _get_output_tokens(usage),
+                "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0) or usage.get("prompt_tokens_details", {}).get("cache_creation", 0),
                 "cache_read_input_tokens": usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)},
     }
 
@@ -326,18 +355,29 @@ def _estimate_input_tokens(body: dict) -> int:
 
 
 def _extract_cache_tokens(usage: dict) -> int:
+    """Return total cached tokens (read + creation) from usage."""
+    total = 0
     details = usage.get("prompt_tokens_details") or {}
-    if "cached_tokens" in details:
-        return details["cached_tokens"]
-    if "cached_tokens" in usage:
-        return usage["cached_tokens"]
-    if "cache_read_input_tokens" in usage:
-        return usage["cache_read_input_tokens"]
-    return 0
+    # Cache read tokens (multiple possible field names across APIs)
+    read = (details.get("cached_tokens") or usage.get("cached_tokens") or
+            usage.get("cache_read_input_tokens") or 0)
+    total += read
+    # Cache creation tokens
+    creation = details.get("cache_creation") or usage.get("cache_creation_input_tokens") or 0
+    total += creation
+    return total
+
+
+def _get_output_tokens(usage: dict) -> int:
+    """Get output tokens including reasoning_tokens from completion_tokens_details."""
+    output = usage.get("completion_tokens") or 0
+    details = usage.get("completion_tokens_details") or {}
+    output += details.get("reasoning_tokens") or 0
+    return output
 
 
 def _elapsed_ms(start_time: float) -> int:
-    return int((time.time() - start_time) * 1000)
+    return max(1, int((time.time() - start_time) * 1000))
 
 
 @app.api_route("/v1/messages", methods=["POST"])
@@ -387,9 +427,9 @@ async def messages(request: Request):
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
             data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
             usage = data.get("usage", {})
-            req_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
-            req_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
-            req_cache = usage.get("cache_read_input_tokens", 0)
+            req_in = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+            req_out = usage.get("output_tokens") or _get_output_tokens(usage) or 0
+            req_cache = _extract_cache_tokens(usage)
             with _token_lock:
                 _token_usage[model_id]["input"] += req_in
                 _token_usage[model_id]["output"] += req_out
@@ -398,7 +438,7 @@ async def messages(request: Request):
             _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
                          req_in, req_out, req_cache, success=True,
                          protocol=protocol, is_stream=is_stream, thinking=thinking_type, effort=effort)
-            return Response(content=resp.content, media_type="application/json")
+            return Response(content=resp.content, media_type="application/json", headers=_forward_headers(resp.headers))
 
         # Estimate input tokens for Anthropic streaming
         est_input = _estimate_input_tokens(body)
@@ -409,6 +449,7 @@ async def messages(request: Request):
             stream_in = None
             stream_out = stream_cache = 0
             _line_buf = ""
+            _sent_data = False
             try:
                 async with _client.stream("POST", endpoint, json=body, headers=a_headers) as resp:
                     if resp.status_code != 200:
@@ -423,6 +464,7 @@ async def messages(request: Request):
                         return
                     async for chunk in resp.aiter_bytes():
                         yield chunk
+                        _sent_data = True
                         _line_buf += chunk.decode("utf-8", errors="replace")
                         while "\n" in _line_buf:
                             line, _line_buf = _line_buf.split("\n", 1)
@@ -438,13 +480,13 @@ async def messages(request: Request):
                                 continue
                             etype = event.get("type", "")
                             if etype == "message_start":
-                                usage = event.get("message", {}).get("usage", {})
-                                stream_in = usage.get("input_tokens")
+                                msg_usage = event.get("message", {}).get("usage", {})
+                                stream_in = msg_usage.get("input_tokens")
                                 if stream_in is not None:
                                     with _token_lock:
                                         _token_usage[model_id]["input"] -= est_input
                                         _token_usage[model_id]["input"] += stream_in
-                                stream_cache = usage.get("cache_read_input_tokens", 0)
+                                stream_cache = _extract_cache_tokens(msg_usage)
                                 if stream_cache:
                                     with _token_lock:
                                         _token_usage[model_id]["cache"] += stream_cache
@@ -455,8 +497,12 @@ async def messages(request: Request):
                 if stream_out:
                     with _token_lock:
                         _token_usage[model_id]["output"] += stream_out
-            except Exception as e:
-                _log(f"  ERROR stream: {e}")
+            except GeneratorExit:
+                raise
+            except BaseException as e:
+                is_cancelled = isinstance(e, asyncio.CancelledError)
+                if not is_cancelled:
+                    _log(f"  ERROR stream: {e}")
                 if stream_in is None:
                     with _token_lock:
                         _token_usage[model_id]["input"] -= est_input
@@ -464,8 +510,12 @@ async def messages(request: Request):
                     with _token_lock:
                         _token_usage[model_id]["output"] += stream_out
                 _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                             stream_in if stream_in is not None else est_input, stream_out, stream_cache, success=False, error=str(e),
+                             stream_in if stream_in is not None else est_input, stream_out, stream_cache, success=False,
+                             error="cancelled" if is_cancelled else str(e),
                              protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort)
+                if not is_cancelled and not _sent_data:
+                    error_payload = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
+                    yield _sse("error", error_payload)
                 return
             logged_in = stream_in if stream_in is not None else est_input
             if stream_in is not None or stream_out:
@@ -498,11 +548,11 @@ async def messages(request: Request):
                 err_msg = resp.text[:200]
             anthro_err = json.dumps({"type": "error", "error": {"type": "api_error", "message": f"HTTP {resp.status_code}: {err_msg}"}},
                                     ensure_ascii=False)
-            return Response(content=anthro_err, status_code=resp.status_code, media_type="application/json")
+            return Response(content=anthro_err, status_code=resp.status_code, media_type="application/json", headers=_forward_headers(resp.headers))
         data = resp.json()
         usage = data.get("usage", {})
         req_in = usage.get("prompt_tokens", 0)
-        req_out = usage.get("completion_tokens", 0)
+        req_out = _get_output_tokens(usage)
         cache = _extract_cache_tokens(usage)
         with _token_lock:
             _token_usage[model_id]["input"] += req_in
@@ -513,7 +563,7 @@ async def messages(request: Request):
                      req_in, req_out, cache, success=True,
                      protocol=protocol, is_stream=False, thinking=thinking_type, effort=effort)
         return Response(content=json.dumps(openai_to_anthropic(data, original_model), ensure_ascii=False),
-                        media_type="application/json")
+                        media_type="application/json", headers=_forward_headers(resp.headers))
 
     # Streaming
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -532,6 +582,7 @@ async def messages(request: Request):
         next_block_idx = 0
         stream_out_tokens = 0
         actual_usage = None
+        finish_reason = None
 
         try:
             async with _client.stream("POST", endpoint, json=oai_body, headers=headers) as resp:
@@ -555,12 +606,13 @@ async def messages(request: Request):
                         final_in = stream_in_est
                         final_out = stream_out_tokens
                         final_cache = 0
+                        final_cache_creation = 0
                         with _token_lock:
                             if actual_usage:
                                 final_in = actual_usage.get("prompt_tokens")
                                 if final_in is None:
                                     final_in = stream_in_est
-                                final_out = actual_usage.get("completion_tokens")
+                                final_out = _get_output_tokens(actual_usage)
                                 if final_out is None:
                                     total = actual_usage.get("total_tokens")
                                     prompt = actual_usage.get("prompt_tokens")
@@ -569,6 +621,7 @@ async def messages(request: Request):
                                 if final_out is None:
                                     final_out = stream_out_tokens
                                 final_cache = _extract_cache_tokens(actual_usage)
+                                final_cache_creation = actual_usage.get("cache_creation_input_tokens", 0) or actual_usage.get("prompt_tokens_details", {}).get("cache_creation", 0)
                                 _token_usage[model_id]["input"] -= stream_in_est
                                 _token_usage[model_id]["input"] += final_in
                                 _token_usage[model_id]["output"] += final_out
@@ -577,15 +630,21 @@ async def messages(request: Request):
                             else:
                                 _token_usage[model_id]["output"] += stream_out_tokens
                         if not started:
-                            started = True
                             yield _sse("message_start", {"type": "message_start", "message": {
                                 "id": msg_id, "type": "message", "role": "assistant", "content": [],
                                 "model": original_model, "stop_reason": None, "stop_sequence": None,
-                                "usage": {"input_tokens": final_in, "output_tokens": 0}}})
+                                "usage": {"input_tokens": final_in, "output_tokens": 0,
+                                          "cache_creation_input_tokens": final_cache_creation,
+                                          "cache_read_input_tokens": final_cache}}})
+                        started = True
                         for idx in open_blocks:
                             yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
                         has_tools = bool(tool_block_idx)
-                        yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use" if has_tools else "end_turn"}, "usage": {"output_tokens": final_out}})
+                        _stop_reason_map = {"stop": "end_turn", "length": "max_tokens", "content_filter": "content_filter"}
+                        stop_reason = _stop_reason_map.get(finish_reason, "end_turn")
+                        if has_tools:
+                            stop_reason = "tool_use"
+                        yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop_reason}, "usage": {"output_tokens": final_out, "input_tokens": final_in, "cache_read_input_tokens": final_cache}})
                         yield _sse("message_stop", {"type": "message_stop"})
                         log_tag = "" if actual_usage else " (est)"
                         _log(f"  ← {model_id} | +{final_in} in{log_tag} | +{final_out} out{log_tag} | +{final_cache} cache")
@@ -607,16 +666,21 @@ async def messages(request: Request):
                     if not choices or not isinstance(choices, list):
                         continue
                     first_choice = choices[0] if choices else {}
+                    if isinstance(first_choice, dict):
+                        if first_choice.get("finish_reason"):
+                            finish_reason = first_choice["finish_reason"]
                     delta = first_choice.get("delta", {}) if isinstance(first_choice, dict) else {}
                     if not delta or not isinstance(delta, dict):
                         delta = {}
 
                     if not started:
-                        started = True
                         yield _sse("message_start", {"type": "message_start", "message": {
                             "id": msg_id, "type": "message", "role": "assistant", "content": [],
                             "model": original_model, "stop_reason": None, "stop_sequence": None,
-                            "usage": {"input_tokens": stream_in_est, "output_tokens": 0}}})
+                            "usage": {"input_tokens": stream_in_est, "output_tokens": 0,
+                                      "cache_creation_input_tokens": 0,
+                                      "cache_read_input_tokens": 0}}})
+                        started = True
 
                     # Text
                     text = ""
@@ -666,18 +730,42 @@ async def messages(request: Request):
                             stream_out_tokens += _estimate_tokens(args)
                             yield _sse("content_block_delta", {"type": "content_block_delta", "index": tool_block_idx[api_idx],
                                        "delta": {"type": "input_json_delta", "partial_json": args}})
-        except Exception as e:
-            _log(f"  ERROR stream: {e}")
+        except GeneratorExit:
+            raise
+        except BaseException as e:
+            is_cancelled = isinstance(e, asyncio.CancelledError)
+            if not is_cancelled:
+                _log(f"  ERROR stream: {e}")
             with _token_lock:
+                adj_in = stream_in_est
+                adj_out = stream_out_tokens
+                adj_cache = 0
+                if actual_usage:
+                    adj_in = actual_usage.get("prompt_tokens", stream_in_est)
+                    if adj_in is None:
+                        adj_in = stream_in_est
+                    adj_out = _get_output_tokens(actual_usage)
+                    if adj_out is None:
+                        adj_out = stream_out_tokens
+                    adj_cache = _extract_cache_tokens(actual_usage)
                 _token_usage[model_id]["input"] -= stream_in_est
+                _token_usage[model_id]["input"] += adj_in
+                _token_usage[model_id]["output"] += adj_out
+                if adj_cache:
+                    _token_usage[model_id]["cache"] += adj_cache
             _save_request(req_id, model_id, original_model, _elapsed_ms(start_time),
-                         stream_in_est, stream_out_tokens, 0, success=False, error=str(e),
+                         adj_in, adj_out, adj_cache, success=False,
+                         error="cancelled" if is_cancelled else str(e),
                          protocol=protocol, is_stream=True, thinking=thinking_type, effort=effort)
-            if started:
-                for idx in open_blocks:
-                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
-                yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "error"}, "usage": {"output_tokens": stream_out_tokens}})
-                yield _sse("message_stop", {"type": "message_stop"})
+            if not is_cancelled:
+                if not started:
+                    error_payload = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
+                    yield _sse("error", error_payload)
+                else:
+                    for idx in open_blocks:
+                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+                    yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "error"}, "usage": {"output_tokens": stream_out_tokens}})
+                    yield _sse("message_stop", {"type": "message_stop"})
 
     return StreamingResponse(stream_gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})

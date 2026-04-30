@@ -50,10 +50,11 @@ def build_display(routes, token_usage, token_lock):
 
     with token_lock:
         usage_snapshot = {m: dict(d) for m, d in token_usage.items()}
+    _default_usage = {"input": 0, "output": 0, "cache": 0}
 
     sum_total = 0
     for route_info in routes.values():
-        d = usage_snapshot[route_info["model"]]
+        d = usage_snapshot.get(route_info["model"], _default_usage)
         sum_total += d["input"] + d["output"] + d["cache"]
 
     sum_in = sum_out = sum_cache = 0
@@ -61,7 +62,7 @@ def build_display(routes, token_usage, token_lock):
     for route_name, route_info in routes.items():
         model = route_info["model"]
         shown.add(model)
-        d = usage_snapshot[model]
+        d = usage_snapshot.get(model, _default_usage)
         total = d["input"] + d["output"] + d["cache"]
         sum_in += d["input"]
         sum_out += d["output"]
