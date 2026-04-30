@@ -115,6 +115,9 @@ def start_input_thread():
     global _log_scroll
     _running = True
 
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return lambda: _running
+
     def _input_thread():
         nonlocal _running
         if sys.platform == "win32":
@@ -197,7 +200,7 @@ def start_input_thread():
 
 def run_terminal_loop(routes, token_usage, token_lock):
     stop = start_input_thread()
-    with Live(build_display(routes, token_usage, token_lock), refresh_per_second=1, screen=True) as live:
+    with Live(build_display(routes, token_usage, token_lock), refresh_per_second=1, screen=sys.stdout.isatty()) as live:
         while stop():
             live.update(build_display(routes, token_usage, token_lock))
             time.sleep(1)
