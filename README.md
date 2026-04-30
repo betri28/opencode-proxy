@@ -14,6 +14,23 @@ A python proxy that lets you use [OpenCode Go](https://opencode.ai/docs/go/) sub
 pip install -r requirements.txt
 ```
 
+## Docker
+
+Build and run with Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+Or with plain Docker:
+
+```bash
+docker build -t opencode-proxy .
+docker run --rm -p 4000:4000 -p 8082:8082 --env-file .env -v ${PWD}/logs:/app/logs opencode-proxy
+```
+
+The container exposes both the API on `4000` and the dashboard on `8082`, and persists the SQLite history database under `logs/`.
+
 ## Configuration
 
 Copy `.env.example` to `.env` and edit:
