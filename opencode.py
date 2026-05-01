@@ -17,7 +17,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 
-from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT
+from config import API_KEY, PROXY, MODELS, ROUTES, get_model_config, HOST, PORT, WEB_PORT, NO_MULTIMODAL
 
 try:
     import tiktoken
@@ -246,7 +246,15 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                         elif mt:
                             _log(f"  WARN: dropped unsupported file type in system: {mt}")
         if sys_blocks:
-            messages.append({"role": "system", "content": sys_blocks})
+            # If only text blocks (no media), join as plain string for maximum compatibility
+            has_sys_media = any(b.get("type") not in ("text",) for b in sys_blocks)
+            if has_sys_media and model not in NO_MULTIMODAL:
+                messages.append({"role": "system", "content": sys_blocks})
+            else:
+                sys_texts = [b.get("text", "") for b in sys_blocks if b.get("type") == "text"]
+                messages.append({"role": "system", "content": "\n".join(sys_texts)})
+                if has_sys_media:
+                    _log(f"  WARN: model {model} does not support multimodal system content, media dropped")
 
     for msg in body.get("messages", []):
         role, content = msg["role"], msg.get("content", "")
@@ -328,6 +336,9 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
 
         # Then emit the main message (text + images + tool_calls + thinking)
         joined_thinking = "\n".join(thinking_parts) if thinking_parts else ""
+        force_string = model in NO_MULTIMODAL
+        if force_string and has_media:
+            _log(f"  WARN: model {model} does not support multimodal content, media dropped")
         if tool_calls:
             out = {
                 "role": role,
@@ -339,14 +350,14 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
             elif thinking and is_asst:
                 out["reasoning_content"] = " "
             messages.append(out)
-        elif has_media:
+        elif has_media and not force_string:
             out = {"role": role, "content": content_blocks}
             if joined_thinking:
                 out["reasoning_content"] = joined_thinking
             elif thinking and is_asst:
                 out["reasoning_content"] = " "
             messages.append(out)
-        elif text_parts or thinking_parts or (thinking and is_asst):
+        elif text_parts or thinking_parts or (thinking and is_asst) or has_media:
             out = {"role": role, "content": "\n".join(text_parts) if text_parts else ""}
             if joined_thinking:
                 out["reasoning_content"] = joined_thinking

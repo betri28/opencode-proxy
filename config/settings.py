@@ -27,7 +27,7 @@ PORT = 4000
 WEB_PORT = 8082
 
 MODELS = {
-    # model_id          : config dict
+    # model_id          : config dict  (multimodal=True → supports array content with images/files)
     "glm-5.1"          : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "glm-5"            : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "kimi-k2.5"        : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
@@ -43,6 +43,9 @@ MODELS = {
     "qwen3.6-plus"     : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "qwen3.5-plus"     : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
 }
+
+# Models that do NOT support array content (only plain string for messages[].content)
+NO_MULTIMODAL = {"glm-5.1", "glm-5"}
 
 def load_routes():
     """Load ROUTES from environment variables or use default."""
