@@ -6,6 +6,7 @@ Convert Anthropic /v1/messages ↔ OpenAI chat/completions
 import json
 import uuid
 import time
+import base64
 import logging
 import os
 import sqlite3
@@ -104,6 +105,56 @@ app = FastAPI(lifespan=lifespan)
 register_dashboard(app, STATIC_DIR, _conn, _db_lock)
 
 
+_IMAGE_FORMATS = ("image/jpeg", "image/png", "image/webp", "image/gif")
+
+_DOCUMENT_FORMATS = (
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+
+_TEXT_FORMATS = (
+    "text/plain", "text/csv", "text/html", "text/markdown",
+    "application/json", "text/xml",
+)
+
+
+def _is_supported_image(mt: str) -> bool:
+    return mt.lower() in _IMAGE_FORMATS
+
+
+def _is_text_format(mt: str) -> bool:
+    return mt.lower() in _TEXT_FORMATS
+
+
+def _convert_media_block(source: dict, mt: str):
+    source_type = source.get("type", "")
+    if _is_text_format(mt):
+        if source_type == "base64" and source.get("data"):
+            try:
+                decoded = base64.b64decode(source["data"]).decode("utf-8", errors="replace")
+                return {"type": "text", "text": decoded}
+            except Exception:
+                _log(f"  WARN: failed to decode text document ({mt})")
+                return None
+        elif source_type == "url" and source.get("url"):
+            return {"type": "text", "text": source["url"]}
+        return None
+    if mt.lower() in _DOCUMENT_FORMATS:
+        ext_map = {
+            "application/pdf": "document.pdf",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "document.docx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "document.xlsx",
+        }
+        filename = ext_map.get(mt.lower(), "document")
+        if source_type == "base64" and source.get("data"):
+            return {"type": "file", "file": {"filename": filename, "file_data": f"data:{mt};base64,{source['data']}"}}
+        elif source_type == "url" and source.get("url"):
+            return {"type": "file", "file": {"filename": filename, "file_data": source["url"]}}
+        return None
+    return None
+
+
 def _sse(event: str, payload: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
 
@@ -143,6 +194,8 @@ def _extract_text(content) -> str:
                     parts.append(i.get("thinking", ""))
                 elif i.get("type") == "image":
                     parts.append(f"[image:{i.get('source', {}).get('type', 'unknown')}]")
+                elif i.get("type") == "document":
+                    parts.append(f"[document:{i.get('source', {}).get('media_type', 'unknown')}]")
                 elif i.get("type") == "redacted_thinking":
                     parts.append("[redacted]")
                 else:
@@ -157,8 +210,43 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
     messages = []
 
     # System prompt
-    if system_text := _extract_text(body.get("system", "")):
-        messages.append({"role": "system", "content": system_text})
+    system = body.get("system", "")
+    if isinstance(system, str):
+        if system:
+            messages.append({"role": "system", "content": system})
+    elif isinstance(system, list):
+        sys_blocks = []
+        for block in system:
+            if isinstance(block, dict):
+                btype = block.get("type")
+                if btype == "text":
+                    sys_blocks.append({"type": "text", "text": block.get("text", "")})
+                elif btype == "image":
+                    source = block.get("source", {})
+                    mt = source.get("media_type", "")
+                    if _is_supported_image(mt):
+                        if source.get("type") == "base64":
+                            img_url = f"data:{mt};base64,{source['data']}"
+                        else:
+                            img_url = source.get("url", "")
+                        sys_blocks.append({"type": "image_url", "image_url": {"url": img_url}})
+                elif btype == "document":
+                    source = block.get("source", {})
+                    mt = source.get("media_type", "")
+                    if _is_supported_image(mt):
+                        if source.get("type") == "base64":
+                            doc_url = f"data:{mt};base64,{source['data']}"
+                        else:
+                            doc_url = source.get("url", "")
+                        sys_blocks.append({"type": "image_url", "image_url": {"url": doc_url}})
+                    else:
+                        converted = _convert_media_block(source, mt)
+                        if converted:
+                            sys_blocks.append(converted)
+                        elif mt:
+                            _log(f"  WARN: dropped unsupported file type in system: {mt}")
+        if sys_blocks:
+            messages.append({"role": "system", "content": sys_blocks})
 
     for msg in body.get("messages", []):
         role, content = msg["role"], msg.get("content", "")
@@ -175,11 +263,13 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
         if not isinstance(content, list):
             continue
 
-        text_parts, tool_calls, thinking_parts, tool_results = [], [], [], []
+        text_parts, content_blocks, tool_calls, thinking_parts, tool_results = [], [], [], [], []
+        has_media = False
 
         for block in content:
             if isinstance(block, str):
                 text_parts.append(block)
+                content_blocks.append({"type": "text", "text": block})
                 continue
             if not isinstance(block, dict):
                 continue
@@ -187,6 +277,34 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
             btype = block.get("type")
             if btype == "text":
                 text_parts.append(block.get("text", ""))
+                content_blocks.append({"type": "text", "text": block.get("text", "")})
+            elif btype == "image":
+                source = block.get("source", {})
+                mt = source.get("media_type", "")
+                if _is_supported_image(mt):
+                    has_media = True
+                    if source.get("type") == "base64":
+                        img_url = f"data:{mt};base64,{source['data']}"
+                    else:
+                        img_url = source.get("url", "")
+                    content_blocks.append({"type": "image_url", "image_url": {"url": img_url}})
+            elif btype == "document":
+                source = block.get("source", {})
+                mt = source.get("media_type", "")
+                if _is_supported_image(mt):
+                    has_media = True
+                    if source.get("type") == "base64":
+                        doc_url = f"data:{mt};base64,{source['data']}"
+                    else:
+                        doc_url = source.get("url", "")
+                    content_blocks.append({"type": "image_url", "image_url": {"url": doc_url}})
+                else:
+                    converted = _convert_media_block(source, mt)
+                    if converted:
+                        has_media = True
+                        content_blocks.append(converted)
+                    elif mt:
+                        _log(f"  WARN: dropped unsupported file type in message: {mt}")
             elif btype == "thinking":
                 thinking_parts.append(block.get("thinking", ""))
             elif btype == "tool_use":
@@ -208,7 +326,7 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
         # Emit tool_result messages first (must immediately follow assistant's tool_calls)
         messages.extend(tool_results)
 
-        # Then emit the main message (text + tool_calls + thinking)
+        # Then emit the main message (text + images + tool_calls + thinking)
         joined_thinking = "\n".join(thinking_parts) if thinking_parts else ""
         if tool_calls:
             out = {
@@ -216,6 +334,13 @@ def anthropic_to_openai(body: dict, model: str) -> dict:
                 "content": None,
                 "tool_calls": tool_calls,
             }
+            if joined_thinking:
+                out["reasoning_content"] = joined_thinking
+            elif thinking and is_asst:
+                out["reasoning_content"] = " "
+            messages.append(out)
+        elif has_media:
+            out = {"role": role, "content": content_blocks}
             if joined_thinking:
                 out["reasoning_content"] = joined_thinking
             elif thinking and is_asst:
@@ -321,7 +446,14 @@ def _estimate_input_tokens(body: dict) -> int:
             if isinstance(s, str):
                 chunks.append(s)
             elif isinstance(s, dict):
-                chunks.append(s.get("text", ""))
+                if s.get("type") == "image":
+                    source = s.get("source", {})
+                    chunks.append(source.get("data", "") or source.get("url", ""))
+                elif s.get("type") == "document":
+                    source = s.get("source", {})
+                    chunks.append(source.get("data", "") or source.get("url", ""))
+                else:
+                    chunks.append(s.get("text", ""))
 
     # Tools definitions
     for tool in body.get("tools", []):
@@ -344,6 +476,12 @@ def _estimate_input_tokens(body: dict) -> int:
                         chunks.append(_extract_text(block.get("content", "")))
                     elif btype == "thinking":
                         chunks.append(block.get("thinking", ""))
+                    elif btype == "image":
+                        source = block.get("source", {})
+                        chunks.append(source.get("data", "") or source.get("url", ""))
+                    elif btype == "document":
+                        source = block.get("source", {})
+                        chunks.append(source.get("data", "") or source.get("url", ""))
                     else:
                         chunks.append(block.get("text", ""))
                         chunks.append(str(block.get("input", "")))
