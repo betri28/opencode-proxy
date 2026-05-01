@@ -79,6 +79,16 @@ Server will start:
 - **API**: http://localhost:4000
 - **Web Dashboard**: http://localhost:8082
 
+## Key Features
+
+- **Extended Thinking & Effort** — Forwards `thinking` and `budget_tokens` parameters as-is to the upstream model. Also supports `effort` (`low` / `medium` / `high`) for models that use effort-based reasoning. Availability depends on the model.
+
+- **Image & Document** — Passes image, PDF, DOCX, and XLSX content blocks through to the upstream model. Whether these are actually processed depends on model support.
+
+- **Web Search** — Forwards web search tool calls to models that natively support it. Results are translated back to Anthropic's `tool_result` format for Claude Code compatibility.
+
+---
+
 ## Web Dashboard
 
 The web interface has 2 tabs:
@@ -121,7 +131,7 @@ For other settings, edit `config/settings.py`:
 
 - `PORT`: API port (default 4000)
 - `WEB_PORT`: Web UI port (default 8082)
-- `MODELS`: Models and endpoints list (hardcoded in code)
+- `MODELS`: Models and endpoints list, including per-model capability flags (`supports_vision`, `supports_pdf`, `supports_office`, `web_search_tool`, `thinking_style`)
 
 ## Keyboard shortcuts (Terminal)
 
