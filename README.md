@@ -4,6 +4,16 @@ A python proxy that lets you use [OpenCode Go](https://opencode.ai/docs/go/) sub
 
 <img width="449" height="319" alt="image" src="https://github.com/user-attachments/assets/9337be52-4681-414c-bb2b-ad624f079659" />
 
+## Key Features
+
+- **Anthropic-compatible Proxy** — Acts as a drop-in replacement for the Anthropic API. Claude Code sends requests to the proxy, which translates and forwards them to the OpenCode Go upstream, then converts the response back to Anthropic format seamlessly.
+
+- **Extended Thinking & Effort** — Forwards `thinking` and `budget_tokens` parameters as-is to the upstream model. Also supports `effort` (`low` / `medium` / `high`) for models that use effort-based reasoning. Availability depends on the model.
+
+- **Image & Document** — Passes image, PDF, DOCX, and XLSX content blocks through to the upstream model. Whether these are actually processed depends on model support.
+
+- **Web Search** — Forwards web search tool calls to models that natively support it. Results are translated back to Anthropic's `tool_result` format for Claude Code compatibility.
+
 ## Requirements
 
 - Python 3.11+
@@ -78,16 +88,6 @@ python opencode.py
 Server will start:
 - **API**: http://localhost:4000
 - **Web Dashboard**: http://localhost:8082
-
-## Key Features
-
-- **Extended Thinking & Effort** — Forwards `thinking` and `budget_tokens` parameters as-is to the upstream model. Also supports `effort` (`low` / `medium` / `high`) for models that use effort-based reasoning. Availability depends on the model.
-
-- **Image & Document** — Passes image, PDF, DOCX, and XLSX content blocks through to the upstream model. Whether these are actually processed depends on model support.
-
-- **Web Search** — Forwards web search tool calls to models that natively support it. Results are translated back to Anthropic's `tool_result` format for Claude Code compatibility.
-
----
 
 ## Web Dashboard
 
