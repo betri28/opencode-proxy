@@ -28,6 +28,7 @@ WEB_PORT = 8082
 
 MODELS = {
     # model_id          : config dict  (multimodal=True → supports array content with images/files)
+    "glm-5.2"          : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "glm-5.1"          : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "glm-5"            : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "kimi-k2.5"        : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
