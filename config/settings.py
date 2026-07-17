@@ -28,12 +28,14 @@ WEB_PORT = 8082
 
 MODELS = {
     # model_id          : config dict  (multimodal=True → supports array content with images/files)
+    "grok-4.5"         : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "glm-5.2"          : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "glm-5.1"          : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "glm-5"            : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "kimi-k2.5"        : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "kimi-k2.6"        : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "kimi-k2.7"        : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
+    "kimi-k3"          : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "deepseek-v4-pro"  : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "deepseek-v4-flash": {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "mimo-v2-pro"      : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
