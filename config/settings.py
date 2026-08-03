@@ -29,6 +29,7 @@ WEB_PORT = 8082
 MODELS = {
     # model_id          : config dict  (multimodal=True → supports array content with images/files)
     "grok-4.5"         : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
+    "gpt-5.6-luna"     : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "glm-5.2"          : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "glm-5.1"          : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "glm-5"            : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
@@ -42,6 +43,7 @@ MODELS = {
     "mimo-v2-omni"     : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "mimo-v2.5-pro"    : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "mimo-v2.5"        : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
+    "hy3"              : {"endpoint": API_BASE_OPENAI,    "protocol": "openai"},
     "minimax-m3"       : {"endpoint": API_BASE_ANTHROPIC, "protocol": "anthropic"},
     "minimax-m2.7"     : {"endpoint": API_BASE_ANTHROPIC, "protocol": "anthropic"},
     "minimax-m2.5"     : {"endpoint": API_BASE_ANTHROPIC, "protocol": "anthropic"},
